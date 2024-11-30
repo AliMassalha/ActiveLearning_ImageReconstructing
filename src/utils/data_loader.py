@@ -1,168 +1,125 @@
-import glob
-import os
 import random
+import cv2
 import numpy as np
 from PIL import Image
 import pandas as pd
-from torch.utils.data import Dataset
+import torch
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
+
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
 
+
 base_path = 'C:/Users/My/Desktop/ActiveLearning_ImageReconstructing/'
-sidd_path = 'data/SIDD_Medium_Srgb/Data'
-renoir_path = 'data/RENOIR'
-polyu_path = 'data/PolyU_PairedImages'
-
-# List to store paths for each dataset
-data = []
-
-# 1. Gather SIDD "pair1" data
-for folder in os.listdir(sidd_path):
-    if "pair1" in folder:
-        folder_path = os.path.join(sidd_path, folder)
-        gt_image = glob.glob(os.path.join(folder_path, '*GT*.PNG'))[0]
-        noisy_image = glob.glob(os.path.join(folder_path, '*NOISY*.PNG'))[0]
-        data.append({'dataset': 'SIDD', 'gt_path': gt_image, 'noisy_path': noisy_image})
-
-# 2. Gather RENOIR data
-camera_types = ['Mi3_Aligned', 'T3i_Aligned', 'S90_Aligned']
-for camera in camera_types:
-    camera_path = os.path.join(renoir_path, camera)
-    for batch_folder in os.listdir(camera_path):
-        batch_path = os.path.join(camera_path, batch_folder)
-        if os.path.isdir(batch_path):
-            reference_files = glob.glob(os.path.join(batch_path, '*Reference.bmp'))
-            noisy_files = glob.glob(os.path.join(batch_path, '*Noisy.bmp'))
-            for ref, noisy in zip(reference_files, noisy_files):
-                data.append({'dataset': 'RENOIR', 'gt_path': ref, 'noisy_path': noisy})
+patches_path = 'data/patches'
 
 
-# 3. Gather PolyU data
-for folder in os.listdir(polyu_path):
-    folder_path = os.path.join(polyu_path, folder)
-    for pair in os.listdir(folder_path):
-        pair_path = os.path.join(folder_path, pair)
-        gt_image = glob.glob(os.path.join(pair_path, '*mean*'))[0]
-        noisy_image = glob.glob(os.path.join(pair_path, '*noisy*'))[0]
-        data.append({'dataset': 'PolyU', 'gt_path': gt_image, 'noisy_path': noisy_image})
-
-df = pd.DataFrame(data)
+import os
+import pandas as pd
+from pathlib import Path
+import torch
+from torch.utils.data import Dataset, DataLoader
+# from get_patches import get_patch_pair_paths
 
 
+def add_noise(image, noise_typ, noise_level=20, normalized=True):
+    if not normalized:
+        image = image / 255.0
 
-class DenoisingDataset(Dataset):
-    def __init__(self, df, patch_size=128, stride=128, num_random_patches=10, 
-                 augment=False, normalize=True):
-        """
-        Data loader for image denoising tasks.
-        
-        Args:
-            df (pd.DataFrame): DataFrame with image pairs.
-            patch_size (int): Size of each patch.
-            stride (int): Stride for patch extraction.
-            num_random_patches (int): Number of random patches to extract.
-            patchify (bool): Whether to use patchification.
-            augment (bool): Whether to apply data augmentation.
-            normalize (bool): Whether to normalize images to [0,1].
-        """
+    BS, ch, row, col = image.shape
+    noise_factor = noise_level / 100.0
+
+    if noise_typ == "gaussian":
+        mean = 0
+        var = 0.1 * noise_factor
+        sigma = var**0.5
+        gauss = torch.randn_like(image,device=image.device) * sigma
+        noisy = image + gauss
+    elif noise_typ == "salt_pepper":
+        s_vs_p = 0.5
+        amount = 0.004 * noise_factor
+        out = image.clone()
+        num_salt = int(amount * image.numel() * s_vs_p)
+        salt_coords = [torch.randint(0, dim, (num_salt,)) for dim in image.shape]
+        out[salt_coords] = 1
+        num_pepper = int(amount * image.numel() * (1 - s_vs_p))
+        pepper_coords = [torch.randint(0, dim, (num_pepper,)) for dim in image.shape]
+        out[pepper_coords] = 0
+        noisy = out
+    elif noise_typ == "poisson":
+        vals = len(torch.unique(image))
+        vals = 2 ** torch.ceil(torch.log2(torch.tensor(vals, dtype=torch.float)))
+        noisy = torch.poisson(image * vals * noise_factor) / vals
+    elif noise_typ == "speckle":
+        gauss = torch.randn_like(image) * noise_factor
+        noisy = image + image * gauss
+    else:
+        raise ValueError(f"Unsupported noise type: {noise_typ}, supported types are gaussian, salt_peper, poisson, speckle")
+
+    if not normalized:
+        noisy = noisy * 255.0
+
+    return torch.clamp(noisy, 0, 255 if not normalized else 1)
+
+class DenoisingPatchDataset(Dataset):
+    def __init__(self, df, transform=None,
+                 normalize=None,active_indices=None, 
+                 addNoise = False,noise_type=None,noise_level=40
+                 ):
+        self.addNoise = addNoise
+        self.noise_type = noise_type
+        self.noise_level = noise_level
+        if self.addNoise:
+          if self.noise_type is None or self.noise_level is None:
+            raise ValueError("If addNoise is True, noise_type and noise_level must be specified.")
+          if self.noise_type not in ["gaussian", "salt_pepper", "poisson", "speckle"]:
+            raise ValueError("noise_type must be one of 'gaussian', 'salt_pepper', 'poisson', 'speckle'.")
+          if self.noise_level < 0 or self.noise_level > 100:
+            raise ValueError("noise_level must be between 0 and 100.")
         self.df = df
-        self.patch_size = patch_size
-        self.stride = stride
-        self.num_random_patches = num_random_patches
-        # self.patchify = patchify
-        self.augment = augment
+        self.transform = transform
         self.normalize = normalize
-        self.transform = self._get_transform()
+        self.addNoise = addNoise
 
-    def _get_transform(self):
-        """Set up augmentations and normalization if needed."""
-        transform_list = []
-        if self.augment:
-            transform_list.extend([
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-                transforms.RandomRotation(15)
-            ])
-        if self.normalize:
-            transform_list.append(transforms.ToTensor())
-        return transforms.Compose(transform_list)
+        if active_indices is not None:
+            self.df = self.df.iloc[active_indices]
 
     def __len__(self):
         return len(self.df)
 
-    def _extract_patches(self, image):
-        """Extract patches from an image based on patch size and stride."""
-        patches = []
-        for y in range(0, image.shape[0] - self.patch_size + 1, self.stride):
-            for x in range(0, image.shape[1] - self.patch_size + 1, self.stride):
-                patch = image[y:y+self.patch_size, x:x+self.patch_size]
-                patches.append(patch)
-        return patches
-
-    def _get_patch_indices(self, num_patches):
-        """Generate random indices for patches if needed."""
-        if num_patches <= self.num_random_patches:
-            return list(range(num_patches))  # All patches if fewer than needed
-        return random.sample(range(num_patches), self.num_random_patches)
-
-    # def _get_patches(self, img, random_patch=False):
-    #     """Get either random patches or whole image patches."""
-    #     if self.patchify:
-    #         patches = self._extract_patches(img)
-    #         if random_patch:
-    #             num_patches_to_sample = min(self.num_random_patches, len(patches))
-    #             patches = random.sample(patches, num_patches_to_sample)
-    #         return patches
-    #     return [img]
-
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        gt_img = np.array(Image.open(row['gt_path']).convert('RGB'))
-        noisy_img = np.array(Image.open(row['noisy_path']).convert('RGB'))
-        
-        # Extract patches once for both images
-        all_gt_patches = self._extract_patches(gt_img)
-        all_noisy_patches = self._extract_patches(noisy_img)
+        clean_path = self.df.iloc[idx]['clean_path']
+        noisy_path = self.df.iloc[idx]['noisy_path']
 
-        if self.num_random_patches and len(all_gt_patches) > self.num_random_patches:
-            indices = self._get_patch_indices(len(all_gt_patches))
-            gt_patches = [all_gt_patches[i] for i in indices]
-            noisy_patches = [all_noisy_patches[i] for i in indices]
+        # Load images as numpy arrays
+        clean_patch = cv2.imread(clean_path, cv2.IMREAD_COLOR)
+        noisy_patch = cv2.imread(noisy_path, cv2.IMREAD_COLOR)
+
+        # Convert to tensor and apply normalization if specified
+        if self.normalize:
+            clean_patch = self.normalize(clean_patch)
+            noisy_patch = self.normalize(noisy_patch)
+            if self.addNoise:
+                noisy_patch = add_noise(noisy_patch.unsqueeze(0),self.noise_type,self.noise_level).squeeze(0)
         else:
-            gt_patches = all_gt_patches
-            noisy_patches = all_noisy_patches
+            clean_patch = torch.from_numpy(clean_patch).permute(2, 0, 1).float()
+            noisy_patch = torch.from_numpy(noisy_patch).permute(2, 0, 1).float()
+            if self.addNoise:
+                noisy_patch = add_noise(noisy_patch.unsqueeze(0),self.noise_type,self.noise_level,normalized=False).squeeze(0)
 
+        # Apply other transforms if defined
         if self.transform:
-            gt_patches = [self.transform(Image.fromarray(patch)) for patch in gt_patches]
-            noisy_patches = [self.transform(Image.fromarray(patch)) for patch in noisy_patches]
+            clean_patch = self.transform(clean_patch)
+            noisy_patch = self.transform(noisy_patch)
 
-        return gt_patches, noisy_patches
+        return noisy_patch, clean_patch
 
-        
-    
 
-train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, shuffle=True)
 
-batch_size = 32
-patch_size = 128
-stride = 128
-num_random_patches = 10
-# Train Dataset and DataLoader
-train_dataset = DenoisingDataset(train_df, patch_size=patch_size, stride=stride, 
-                                 num_random_patches=num_random_patches,  
-                                 augment=False, normalize=True)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-# Test Dataset and DataLoader
-test_dataset = DenoisingDataset(test_df, patch_size=patch_size, stride=stride, 
-                                num_random_patches=num_random_patches, 
-                                augment=False, normalize=True)
 
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 
 
@@ -171,9 +128,9 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 
 def visualize_patches_in_tensor(batch, index=0):
-    """Visualize all 32 patches in a single tensor in the batch."""
+    """Visualize all patches in a single tensor in the batch."""
     # Select the batch tensor to visualize
-    tensor = batch[index]  # (32, 3, 128, 128)
+    tensor = batch
     num_patches = tensor.shape[0]
     
     # Calculate grid size for visualization
@@ -190,88 +147,23 @@ def visualize_patches_in_tensor(batch, index=0):
     plt.show()
 
 
-def visualize_corresponding_patches(batch, patch_index=0):
-    """Visualize the patches at the same index across all tensors in the batch."""
-    num_images = len(batch)
+# def visualize_corresponding_patches(batch, patch_index=0):
+#     """Visualize the patches at the same index across all tensors in the batch."""
+#     num_images = len(batch)
     
-    fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
-    for i in range(num_images):
-        patch = TF.to_pil_image(batch[i][patch_index])  # Select the corresponding patch in each image
-        axs[i].imshow(patch)
-        axs[i].set_title(f'Image {i}, Patch {patch_index}')
-        axs[i].axis('off')
+#     fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
+#     for i in range(num_images):
+#         patch = TF.to_pil_image(batch[i][patch_index])  # Select the corresponding patch in each image
+#         axs[i].imshow(patch)
+#         axs[i].set_title(f'Image {i}, Patch {patch_index}')
+#         axs[i].axis('off')
     
-    plt.suptitle(f'Patch index {patch_index} from each tensor in the batch')
-    plt.show()
-
-
-# Example: Visualize a single batch
-print('train_loader: ',len(train_loader))
-for gt_batch, noisy_batch in train_loader:
-    try:
-        print(f"GT Batch Shape: {gt_batch.shape}")
-        print(f"GT Batch type: {type(gt_batch)}")
-        print(f"Noisy Batch Shape: {noisy_batch.shape}")
-        print(f"Noisy Batch type: {type(noisy_batch)}")
-    except:
-        print(f"GT Batch type: {type(gt_batch)}")
-        print(f"GT Batch Shape: {len(gt_batch)}")
-        print(f"GT Batch member type: {type(gt_batch[0])}")
-        print(f"GT Batch member shape: {gt_batch[0].shape}")
-
-        print(f"Noisy Batch type: {type(noisy_batch)}")
-        print(f"Noisy Batch Shape: {len(noisy_batch)}")
-        print(f"Noisy Batch member type: {type(noisy_batch[0])}")
-        print(f"Noisy Batch member shape: {noisy_batch[0].shape}")
-    
-    # visualize_patches_in_tensor(gt_batch, index=0)  # visualize all patches in the first tensor of gt_batch
-    # visualize_patches_in_tensor(noisy_batch, index=0)  
-    
-    visualize_corresponding_patches(gt_batch, patch_index=0)  # visualize patch 0 across all images in gt_batch
-    visualize_corresponding_patches(noisy_batch, patch_index=0)
-    
-    break
+#     plt.suptitle(f'Patch index {patch_index} from each tensor in the batch')
+#     plt.show()
 
 
 
-# print('test_loader: ',len(test_loader))
-# for gt_batch, noisy_batch in test_loader:
-#     try:
-#         print(f"GT Batch Shape: {gt_batch.shape}")
-#         print(f"GT Batch type: {type(gt_batch)}")
-#         print(f"Noisy Batch Shape: {noisy_batch.shape}")
-#         print(f"Noisy Batch type: {type(noisy_batch)}")
-#     except:
-#         print(f"GT Batch type: {type(gt_batch)}")
-#         print(f"GT Batch Shape: {len(gt_batch)}")
-#         print(f"GT Batch member type: {type(gt_batch[0])}")
-#         print(f"GT Batch member shape: {gt_batch[0].shape}")
-
-#         print(f"Noisy Batch type: {type(noisy_batch)}")
-#         print(f"Noisy Batch Shape: {len(noisy_batch)}")
-#         print(f"Noisy Batch member type: {type(noisy_batch[0])}")
-#         print(f"Noisy Batch member shape: {noisy_batch[0].shape}")
-#     break
 
 
-# train_loader:  22
-# GT Batch type: <class 'list'>
-# GT Batch Shape: 10
-# GT Batch member type: <class 'torch.Tensor'>
-# GT Batch member shape: torch.Size([32, 3, 128, 128])
-# Noisy Batch type: <class 'list'>
-# Noisy Batch Shape: 10
-# Noisy Batch member type: <class 'torch.Tensor'>
-# Noisy Batch member shape: torch.Size([32, 3, 128, 128])
 
-
-# test_loader:  6
-# GT Batch type: <class 'list'>
-# GT Batch Shape: 10
-# GT Batch member type: <class 'torch.Tensor'>
-# GT Batch member shape: torch.Size([32, 3, 128, 128])
-# Noisy Batch type: <class 'list'>
-# Noisy Batch Shape: 10
-# Noisy Batch member type: <class 'torch.Tensor'>
-# Noisy Batch member shape: torch.Size([32, 3, 128, 128])
 

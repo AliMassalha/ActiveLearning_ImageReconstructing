@@ -1,0 +1,16 @@
+# Ignore clean and noisy folders under data/patches/
+data/patches/clean/
+data/patches/noisy/
+
+# Ignore all __pycache__ folders and their contents
+**/__pycache__/
+
+# Optional: Ignore compiled Python files (if not necessary)
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore temporary or system files (optional)
+.DS_Store
+Thumbs.db
+*.log

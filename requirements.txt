@@ -1,0 +1,12 @@
+numpy
+torch
+torchvision
+scikit-learn
+matplotlib
+scipy
+jupyter
+scikit-images
+seaborn
+opencv-python
+tqdm
+patchify
