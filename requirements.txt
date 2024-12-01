@@ -10,3 +10,4 @@ seaborn
 opencv-python
 tqdm
 patchify
+gdown
