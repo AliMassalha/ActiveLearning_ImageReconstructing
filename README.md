@@ -1,6 +1,4 @@
-Here's a **README.md** file based on your instructions:
 
----
 
 # **Active Learning for Image Denoising**
 
